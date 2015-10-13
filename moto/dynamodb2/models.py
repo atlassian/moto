@@ -3,6 +3,9 @@ from collections import defaultdict
 import datetime
 import json
 
+import ply.lex as lex
+import ply.yacc as yacc
+
 from moto.compat import OrderedDict
 from moto.core import BaseBackend
 from .comparisons import get_comparison_func
@@ -101,25 +104,11 @@ class Item(object):
             "Item": included
         }
 
-    def update(self, update_expression):
-        ACTION_VALUES = ['SET', 'REMOVE']
+    def update(self, update_expression, expression_attribute_values):
+        parser = yacc.yacc()
 
-        action = None
-        for value in update_expression.split():
-            if value in ACTION_VALUES:
-                # An action
-                action = value
-                continue
-            else:
-                # A Real value
-                value = value.lstrip(":").rstrip(",")
-
-            if action == "REMOVE":
-                self.attrs.pop(value, None)
-            elif action == 'SET':
-                key, value = value.split("=:")
-                # TODO deal with other types
-                self.attrs[key] = DynamoType({"S": value})
+        parser.attrs = ParserAttrs(self, expression_attribute_values)
+        parser.parse(update_expression, lexer=lex.lex())
 
 
 class Table(object):
@@ -411,12 +400,14 @@ class DynamoDBBackend(BaseBackend):
 
         return table.scan(scan_filters)
 
-    def update_item(self, table_name, key, update_expression):
+    def update_item(self, table_name, key, update_expression,
+                    expression_attribute_values):
         table = self.get_table(table_name)
 
-        hash_value = DynamoType(key)
-        item = table.get_item(hash_value)
-        item.update(update_expression)
+        hash_key, range_key = self.get_keys_value(table, key)
+        item = table.get_item(hash_key, range_key)
+        if item:
+            item.update(update_expression, expression_attribute_values)
         return item
 
     def delete_item(self, table_name, keys):
@@ -428,3 +419,175 @@ class DynamoDBBackend(BaseBackend):
 
 
 dynamodb_backend2 = DynamoDBBackend()
+
+# ---------------------------------------------------------------------------
+# A parser for update expressions
+# http://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.Modifying.html#Expressions.Modifying.UpdateExpressions
+
+
+class ParserAttrs(object):
+    """
+    Object for passing context through the parser, rather than relying on
+    globals.
+    """
+    def __init__(self, item, expr_attr_values):
+        self.item = item
+        self.expr_attr_values = expr_attr_values
+
+tokens = (
+    'SET', 'REMOVE', 'ADD', 'DELETE', 'NAME', 'NUMBER',
+    'PLUS', 'MINUS', 'EQUALS',
+    'ATTR_PREFIX', 'COMMA'
+)
+
+# Tokens
+
+t_PLUS = r'\+'
+t_MINUS = r'-'
+t_EQUALS = r'='
+t_ATTR_PREFIX = r':'
+t_COMMA = r','
+
+reserved = {
+    'SET': 'SET',
+    'REMOVE': 'REMOVE',
+    'ADD': 'ADD',
+    'DELETE': 'DELETE',
+}
+
+
+def t_NUMBER(t):
+    r'\d+'
+    try:
+        t.value = int(t.value)
+    except ValueError:
+        print("Integer value too large %d", t.value)
+        t.value = 0
+    return t
+
+
+def t_NAME(t):
+    r'[a-zA-Z_][a-zA-Z_0-9]*'
+    t.type = reserved.get(t.value, 'NAME')    # Check for reserved words
+    return t
+
+
+# Ignored characters
+t_ignore = " \t"
+
+
+def t_error(t):
+    print("Illegal character '%s'" % t.value[0])
+    t.lexer.skip(1)
+
+# Parsing rules
+
+precedence = (
+    ('left', 'PLUS', 'MINUS'),
+)
+
+
+def p_update_expression(t):
+    '''update_expression : statement
+                         | update_expression statement'''
+    pass
+
+
+def p_statement_set(t):
+    'statement : SET set_actions'
+    pass
+
+
+def p_statement_remove(t):
+    'statement : REMOVE remove_names'
+    pass
+
+
+def p_statement_add(t):
+    'statement : ADD add_actions'
+    pass
+
+
+def p_statement_delete(t):
+    'statement : DELETE delete_actions'
+    pass
+
+
+def p_statement_set_actions(t):
+    '''set_actions : set_action
+                   | set_actions COMMA set_action'''
+    pass
+
+
+def p_statement_set_action(t):
+    'set_action : NAME EQUALS expression'
+    t.parser.attrs.item.attrs[t[1]] = t[3]
+
+
+def p_statement_remove_names(t):
+    '''remove_names : remove_name
+                    | remove_names COMMA remove_name'''
+    pass
+
+
+def p_statement_remove_name(t):
+    'remove_name : NAME'
+    t.parser.attrs.item.attrs.pop(t[1])
+
+
+def p_statement_add_actions(t):
+    '''add_actions : add_action
+                   | add_actions COMMA add_action'''
+    pass
+
+
+def p_statement_add_action(t):
+    'add_action : NAME expression'
+    t.parser.attrs.item.attrs[t[2]] = t[3]
+
+
+def p_statement_delete_actions(t):
+    '''delete_actions : delete_action
+                      | delete_actions COMMA delete_action'''
+    pass
+
+
+def p_statement_delete_action(t):
+    'delete_action : NAME expression'
+    pass  # Remove the key <expression> from the set.
+
+
+def p_expression_binop(t):
+    '''expression : expression PLUS expression
+                  | expression MINUS expression'''
+    if t[2] == '+':
+        t[0] = t[1] + t[3]
+    elif t[2] == '-':
+        t[0] = t[1] - t[3]
+
+
+def p_expression_number(t):
+    'expression : NUMBER'
+    t[0] = t[1]
+
+
+def p_expression_name(t):
+    'expression : NAME'
+    try:
+        t[0] = t.parser.attrs.item.attrs[t[1]]
+    except LookupError:
+        print("Undefined name '%s'" % t[1])
+        t[0] = 0
+
+
+def p_attr_prefix(t):
+    'expression : ATTR_PREFIX NAME'
+    try:
+        t[0] = DynamoType(t.parser.attrs.expr_attr_values[':' + t[2]])
+    except LookupError:
+        print("Undefined name '%s'" % t[2])
+        t[0] = 0
+
+
+def p_error(t):
+    print("Syntax error at '%s'" % t.value)

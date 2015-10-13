@@ -374,8 +374,15 @@ class DynamoHandler(BaseResponse):
         name = self.body['TableName']
         key = self.body['Key']
         update_expression = self.body['UpdateExpression']
-        item = dynamodb_backend2.update_item(name, key, update_expression)
+        expression_attribute_values = self.body['ExpressionAttributeValues']
+        item = dynamodb_backend2.update_item(name, key, update_expression,
+                                             expression_attribute_values)
 
-        item_dict = item.to_json()
-        item_dict['ConsumedCapacityUnits'] = 0.5
-        return dynamo_json_dump(item_dict)
+        if item:
+            item_dict = item.to_json()
+            item_dict['ConsumedCapacityUnits'] = 0.5
+            return dynamo_json_dump(item_dict)
+        else:
+            # Item not found
+            er = '{}'
+            return self.error(er, status=400)
