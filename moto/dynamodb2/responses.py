@@ -202,7 +202,7 @@ class DynamoHandler(BaseResponse):
         else:
             # Item not found
             er = '{}'
-            return self.error(er, status=200)
+            return self.error(er, status=400)
 
     def batch_get_item(self):
         table_batches = self.body['RequestItems']
