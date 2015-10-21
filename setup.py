@@ -11,6 +11,7 @@ install_requires = [
     "xmltodict",
     "six",
     "werkzeug",
+    "ply",
 ]
 
 extras_require = {
